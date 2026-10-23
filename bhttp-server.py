@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-import argparse, asyncio, hashlib, struct, sys
+import argparse, asyncio, hashlib, struct, sys, socket
 
 MAGIC = b"BHP1"
-LONGPOLL = 2.0
+# Reducido de 2.0s a 0.25s para máxima fluidez y respuesta inmediata
+LONGPOLL = 0.25
 
 def log(msg):
     sys.stderr.write("[bhttp] %s\n" % msg)
@@ -47,11 +48,18 @@ class Session:
     async def connect(self):
         host, port = self.backend
         self.br, self.bw = await asyncio.open_connection(host, port)
+        try:
+            raw_sock = self.bw.get_extra_info('socket')
+            if raw_sock:
+                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
         asyncio.create_task(self._reader())
 
     async def _reader(self):
         try:
             while True:
+                # Lectura balanceada de 64KB
                 data = await self.br.read(65536)
                 if not data:
                     break
@@ -80,7 +88,7 @@ class Session:
 
     async def download(self, seq, maxlen, deadline):
         if maxlen <= 0:
-            maxlen = 1399
+            maxlen = 16384
         loop = asyncio.get_running_loop()
         async with self.cond:
             while True:
@@ -100,7 +108,7 @@ class Session:
                         return b""
                     if not self.eof and loop.time() < deadline:
                         try:
-                            await asyncio.wait_for(self.cond.wait(), timeout=max(0.01, deadline - loop.time()))
+                            await asyncio.wait_for(self.cond.wait(), timeout=max(0.002, deadline - loop.time()))
                         except asyncio.TimeoutError:
                             pass
                         continue
@@ -146,6 +154,13 @@ class Server:
 
     async def handle(self, reader, writer):
         try:
+            raw_sock = writer.get_extra_info('socket')
+            if raw_sock:
+                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception:
+            pass
+
+        try:
             while True:
                 hdr = await reader.readexactly(29)
                 mode = hdr[0]
@@ -171,7 +186,7 @@ class Server:
                     writer.write(bytes([0]) + (0).to_bytes(4, "big"))
                     await writer.drain()
                 elif mode == 2:
-                    chunk = await s.download(seq, ln if ln > 0 else 1399, asyncio.get_running_loop().time() + LONGPOLL)
+                    chunk = await s.download(seq, ln if ln > 0 else 16384, asyncio.get_running_loop().time() + LONGPOLL)
                     self._send_data(writer, sess, mode, seq, chunk)
                     await writer.drain()
                 elif mode == 3:
@@ -179,9 +194,9 @@ class Server:
                         chunk_size = int.from_bytes(payload[0:4], "big")
                         count = payload[5]
                     else:
-                        chunk_size, count = 1399, 1
+                        chunk_size, count = 16384, 1
                     if chunk_size <= 0:
-                        chunk_size = 1399
+                        chunk_size = 16384
                     if count <= 0:
                         count = 1
                     deadline = asyncio.get_running_loop().time() + LONGPOLL
@@ -212,7 +227,7 @@ class Server:
         writer.write(bytes([2]) + len(body).to_bytes(4, "big") + body)
 
     async def serve(self):
-        srv = await asyncio.start_server(self.handle, self.host, self.port, backlog=512)
+        srv = await asyncio.start_server(self.handle, self.host, self.port, backlog=2048)
         async with srv:
             await srv.serve_forever()
 
